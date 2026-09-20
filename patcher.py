@@ -19,8 +19,8 @@ DEFAULT_DLL = "bin\\lgLcdApi_x86.dll"
 # first bytes of the new stub: push ebx / call $+5 / pop ebx
 STUB_SIGNATURE = bytes([0x53, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x5B])
 
-EXPORT_OLD = "CommandLine_Tier0"
-EXPORT_NEW = "CommandLine"
+IMPORT_OLD = "CommandLine_Tier0"
+IMPORT_NEW = "CommandLine"
 
 SIGNATURES = {
     "func_start": [
@@ -254,62 +254,38 @@ def build_stub(start_va, iat_ll, iat_gpa, v_hlib, v_gi, v_iface, cleanup_va, dll
 def read_cstr(data, off):
     return bytes(data[off:data.index(b"\0", off)])
 
-def rename_export(pe, data, old, new):
-    """Rename an exported symbol in place (new name must not be longer than the old one).
-    Keeps the export name table sorted, as the Windows loader binary-searches it.
-    Returns True if renamed, False if the file already has `new` and not `old`."""
+def rename_import(pe, data, old, new):
     old_b, new_b = old.encode("ascii"), new.encode("ascii")
     if len(new_b) > len(old_b):
-        die("new export name is longer than the old one; can't rename in place")
+        die("new import name is longer than the old one; can't rename in place")
 
-    d = pe.OPTIONAL_HEADER.DATA_DIRECTORY[0]          # IMAGE_DIRECTORY_ENTRY_EXPORT
-    if not d.VirtualAddress or not d.Size:
-        die("this file has no export directory")
-    ed = pe.get_offset_from_rva(d.VirtualAddress)
-    (_chr, _ts, _maj, _min, _name, _base, _nfuncs,
-     n_names, _rva_funcs, rva_names, rva_ords) = struct.unpack_from("<IIHHIIIIIII", data, ed)
-    if not n_names:
-        die("this file exports nothing by name")
-    names_off = pe.get_offset_from_rva(rva_names)
-    ords_off = pe.get_offset_from_rva(rva_ords)
+    renamed, already, seen = 0, 0, set()
+    for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []):
+        dll = entry.dll.decode("latin1")
+        for imp in entry.imports:
+            if imp.name == new_b:
+                already += 1
+            if imp.name != old_b:
+                continue
+            soff = pe.get_offset_from_rva(imp.hint_name_table_rva + 2)   # skip the 2-byte hint
+            if soff in seen:                        # descriptor sharing the same name entry
+                continue
+            if bytes(data[soff:soff + len(old_b) + 1]) != old_b + b"\0":
+                die(f"unexpected bytes at {soff:#x}; import name entry doesn't look right")
+            seen.add(soff)
+            span = len(old_b) + 1
+            data[soff:soff + span] = new_b + b"\0" * (span - len(new_b))
+            print(f"    {dll}: '{old}' -> '{new}'  (name entry at file offset {soff:#x})")
+            renamed += 1
 
-    # [name, name_rva, ordinal, string_file_offset]
-    entries = []
-    for i in range(n_names):
-        (nrva,) = struct.unpack_from("<I", data, names_off + 4 * i)
-        (ordn,) = struct.unpack_from("<H", data, ords_off + 2 * i)
-        soff = pe.get_offset_from_rva(nrva)
-        entries.append([read_cstr(data, soff), nrva, ordn, soff])
-
-    has_old = [e for e in entries if e[0] == old_b]
-    has_new = [e for e in entries if e[0] == new_b]
-    if has_old and has_new:
-        die(f"both '{old}' and '{new}' are already exported; renaming would create a duplicate")
-    if has_new:
-        return False
-    if not has_old:
-        similar = ", ".join(e[0].decode("latin1") for e in entries if b"CommandLine" in e[0])
-        die(f"export '{old}' not found" + (f" (similar: {similar})" if similar else ""))
-
-    target = has_old[0]
-    soff = target[3]
-    span = len(old_b) + 1
-    # refuse if another name pointer lands inside the bytes we're about to zero (shared string tail)
-    for e in entries:
-        if e is not target and soff <= e[3] < soff + span:
-            die(f"export string is shared with '{e[0].decode('latin1')}'; can't rename in place")
-
-    old_index = entries.index(target)
-    data[soff:soff + span] = new_b + b"\0" * (span - len(new_b))
-    target[0] = new_b
-
-    ordered = sorted(entries, key=lambda e: e[0])     # byte-wise, same as the loader's strcmp
-    for i, e in enumerate(ordered):
-        struct.pack_into("<I", data, names_off + 4 * i, e[1])
-        struct.pack_into("<H", data, ords_off + 2 * i, e[2])
-
-    print(f"    ordinal {target[2]}: name-table slot {old_index} -> {ordered.index(target)}")
-    return True
+    if not renamed and not already:
+        similar = sorted({imp.name.decode("latin1")
+                          for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", [])
+                          for imp in entry.imports
+                          if imp.name and b"CommandLine" in imp.name})
+        die(f"import '{old}' not found in the import table"
+            + (f" (similar: {', '.join(similar)})" if similar else ""))
+    return renamed  
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -317,7 +293,7 @@ def main():
     ap.add_argument("-o", "--output", help="default: <name>_patched<ext>")
     ap.add_argument("--dll", default=DEFAULT_DLL, help=f"DLL to load (default {DEFAULT_DLL})")
     ap.add_argument("--func-size", type=lambda x: int(x, 0), help="size of the original function in bytes (skips the capstone measurement)")
-    ap.add_argument("--fix-pe", action="store_true", help=f"tier0.dll: rename export {EXPORT_OLD} -> {EXPORT_NEW} and exit")
+    ap.add_argument("--fix-pe", action="store_true", help=f"tier0.dll: rename export {IMPORT_OLD} -> {IMPORT_NEW} and exit")
     ap.add_argument("--dump", action="store_true", help="hexdump the located function and exit")
     args = ap.parse_args()
 
@@ -329,6 +305,21 @@ def main():
     image_base = pe.OPTIONAL_HEADER.ImageBase
     image_lo, image_hi = image_base, image_base + pe.OPTIONAL_HEADER.SizeOfImage
     print(f"[*] ImageBase {image_base:#x}")
+
+    out = Path(args.output) if args.output else src.with_name(src.stem + "_patched" + src.suffix)
+
+    if args.fix_pe:
+        print(f"[*] renaming tier0 export {IMPORT_OLD} -> {IMPORT_NEW}")
+        if rename_import(pe, data, IMPORT_OLD, IMPORT_NEW):
+            out.write_bytes(bytes(data))
+            print(f"[+] wrote {out}")
+
+            # re-read the file we just wrote so everything below works on it
+            data = bytearray(out.read_bytes())
+            pe.close()
+            pe = pefile.PE(data=bytes(data))
+        else:
+            print(f"    no '{IMPORT_OLD}' import left, skipping")
 
     def get(name):
         if name in IAT_NAMES:
